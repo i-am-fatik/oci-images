@@ -1,0 +1,67 @@
+name: images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - images/**
+      - .github/workflows/images.yml
+  workflow_dispatch:
+    inputs:
+      image:
+        description: the directory under images/ to rebuild
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  changed:
+    name: the images this push touched
+    runs-on: ubuntu-latest
+    outputs:
+      names: ${{ steps.list.outputs.names }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: list
+        env:
+          REQUESTED: ${{ inputs.image }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ -n "$REQUESTED" ]; then
+            names=$REQUESTED
+          elif git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            names=$(git diff --name-only "$BEFORE" HEAD -- images/ | cut -d/ -f2 | sort -u)
+          else
+            names=$(ls images)
+          fi
+          json=$(for n in $names; do [ -f "images/$n/Dockerfile" ] && echo "$n"; done | jq -R . | jq -cs .)
+          echo "names=$json" >> "$GITHUB_OUTPUT"
+
+  image:
+    name: ${{ matrix.name }} built from source on a current toolchain
+    needs: changed
+    if: needs.changed.outputs.names != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        name: ${{ fromJSON(needs.changed.outputs.names) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: an image nobody can push
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: build it and push it under its upstream version
+        env:
+          NAME: ${{ matrix.name }}
+        run: |
+          case "$NAME" in ''|*[!a-z0-9-]*) echo "not an image directory: $NAME"; exit 1;; esac
+          image=ghcr.io/${{ github.repository_owner }}/$NAME
+          version=$(sed -n 's/^ARG [A-Z_]*_VERSION=v\{0,1\}//p' "images/$NAME/Dockerfile" | head -1)
+          docker build --provenance=false --platform linux/amd64 --tag "$image:$version" "images/$NAME"
+          docker push "$image:$version"
+          echo "$NAME: $(docker inspect --format '{{index .RepoDigests 0}}' "$image:$version")" >> "$GITHUB_STEP_SUMMARY"
